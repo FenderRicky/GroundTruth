@@ -1,27 +1,32 @@
 """
-Personal GPT API for Vineeth Thadigotla — Vercel FastAPI entrypoint.
-Runs on Groq's free tier (OpenAI-compatible API) — no credit card, generous
-daily limit, fast inference.
+Groundtruth API — Vercel FastAPI entrypoint.
 
-Why no RAG / embeddings here:
-The knowledge base is a single resume — a few hundred words. Retrieval only
-earns its cost when the knowledge base is too big to fit in one prompt.
-Here, it's cheaper and simpler to just inline the whole resume as context
-on every request: one API call per question.
+Analyzes a real GitHub profile (via GitHub's public REST API) alongside an
+uploaded resume, optionally against a target job description, and produces
+a structured readiness report: skill gaps, over-exposure flags, strengths,
+and concrete next steps.
 
-Rate limiting:
-This adds a soft per-instance limit as a safety net, but Groq's own free-tier
-quota (enforced server-side, per API key/account) is the real backstop — see
-the note at the bottom of this file.
+Built fresh — not a continuation of either prior InsightFlow repo, though
+informed by what worked in them (real GitHub API fetching, structured LLM
+JSON output, tier-1 benchmark framing).
+
+No RAG/embeddings needed here — each analysis is a one-shot job over a
+single person's data, not a searchable knowledge base.
 """
 
 import os
-import time
-from collections import deque
+import io
+import json
+import re
+import asyncio
+import logging
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+import httpx
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
+from pypdf import PdfReader
 from groq import Groq
 
 # ---------------------------------------------------------------------------
@@ -29,14 +34,20 @@ from groq import Groq
 # ---------------------------------------------------------------------------
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")  # optional, but strongly recommended — see README
 GENERATION_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 FALLBACK_MODEL = os.environ.get("GROQ_FALLBACK_MODEL", "llama-3.1-8b-instant")
+GITHUB_API = "https://api.github.com"
 
-# Soft rate limit: max requests per rolling window, per warm instance.
-MAX_REQUESTS = 20
-WINDOW_SECONDS = 3600  # 1 hour
+app = FastAPI(title="Groundtruth")
+log = logging.getLogger("groundtruth")
 
-app = FastAPI(title="Ask Vineeth")
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request, exc):
+    # Never return plain-text "Internal Server Error" — always JSON the frontend can read.
+    log.exception("Unhandled error")
+    return JSONResponse(status_code=500, content={"detail": f"Server error: {type(exc).__name__}: {str(exc)[:300]}"})
 
 _client = None
 
@@ -45,730 +56,646 @@ def get_client() -> Groq:
     global _client
     if _client is None:
         if not GROQ_API_KEY:
-            raise HTTPException(
-                status_code=500,
-                detail="GROQ_API_KEY environment variable is not set.",
-            )
+            raise HTTPException(status_code=500, detail="GROQ_API_KEY environment variable is not set.")
         _client = Groq(api_key=GROQ_API_KEY)
     return _client
 
 
 # ---------------------------------------------------------------------------
-# Soft rate limiter (per warm instance — see note at bottom of file)
+# GitHub data fetching — real API calls, whole profile, not one repo
 # ---------------------------------------------------------------------------
 
-_request_times: deque = deque()
+def extract_github_username(raw: str) -> str:
+    raw = raw.strip()
+    if "github.com" in raw:
+        raw = raw.split("github.com/")[-1]
+    return raw.strip("/").split("/")[0]
 
 
-def check_rate_limit():
-    now = time.time()
-    while _request_times and now - _request_times[0] > WINDOW_SECONDS:
-        _request_times.popleft()
-    if len(_request_times) >= MAX_REQUESTS:
-        raise HTTPException(
-            status_code=429,
-            detail="This demo is rate-limited to keep API costs predictable. Try again later.",
-        )
-    _request_times.append(now)
+async def fetch_github_profile(username: str) -> dict:
+    headers = {"Accept": "application/vnd.github.v3+json", "User-Agent": "Groundtruth/1.0"}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
 
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            user_resp = await client.get(f"{GITHUB_API}/users/{username}", headers=headers)
+        except httpx.HTTPError:
+            raise HTTPException(status_code=502, detail="Could not reach the GitHub API. Try again.")
+        if user_resp.status_code == 404:
+            raise HTTPException(status_code=400, detail=f"GitHub user '{username}' not found.")
+        if user_resp.status_code == 403:
+            raise HTTPException(
+                status_code=429,
+                detail="GitHub API rate limit hit or token invalid. This app needs a GITHUB_TOKEN environment variable set for reliable use — see README.",
+            )
+        if user_resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="GitHub API error while fetching profile.")
+        user = user_resp.json()
 
-# ---------------------------------------------------------------------------
-# Knowledge (inlined directly — no retrieval needed for a doc this small)
-# ---------------------------------------------------------------------------
+        try:
+            repos_resp = await client.get(
+                f"{GITHUB_API}/users/{username}/repos",
+                headers=headers,
+                params={"sort": "updated", "per_page": 30, "type": "owner"},
+            )
+        except httpx.HTTPError:
+            raise HTTPException(status_code=502, detail="Could not reach the GitHub API. Try again.")
+        repos = repos_resp.json() if repos_resp.status_code == 200 else []
 
-SYSTEM_PROMPT = """You are the personal AI assistant of Vineeth Thadigotla (also known professionally as "Ricky Fender"). You answer questions about him accurately and helpfully, speaking about him in the third person unless asked to write something as if you were him. Stay grounded only in the facts below — if something isn't covered, say you don't have that detail rather than guessing. Keep answers concise and conversational.
+        non_fork = [r for r in repos if not r.get("fork")]
+        top_repos = sorted(non_fork, key=lambda r: (r.get("stargazers_count", 0), r.get("updated_at", "")), reverse=True)[:8]
 
-═══════════════════════════════════════════════════════════════════
-IDENTITY & BACKGROUND
-═══════════════════════════════════════════════════════════════════
-- Full name: Vineeth Thadigotla
-- Professional alias: Ricky Fender
-- B.Tech CSE (Data Science), MLR Institute of Technology (MLRIT), Hyderabad. 3rd year, batch 2024–2028.
-- Based in Hyderabad, India.
-- Freelancer on Upwork; operates under rickyfender00@gmail.com for professional work.
+        language_totals: dict = {}
+        readme_hits = 0
 
-APPROVED CONTACT / LINKS (share only these — never any personal info like phone or private email):
-- Portfolio: https://rickyfender.vercel.app
-- GitHub: https://github.com/FenderRicky
-- LinkedIn: https://www.linkedin.com/in/vineeth-thadigotla-0569381b9/
-- Instagram: https://www.instagram.com/fender_ricky
-- Freelance Email: rickyfender00@gmail.com
+        async def repo_extras(repo):
+            try:
+                lang_r, readme_r = await asyncio.gather(
+                    client.get(f"{GITHUB_API}/repos/{username}/{repo['name']}/languages", headers=headers),
+                    client.get(f"{GITHUB_API}/repos/{username}/{repo['name']}/readme", headers=headers),
+                )
+                return lang_r, readme_r
+            except httpx.HTTPError:
+                return None, None
 
-═══════════════════════════════════════════════════════════════════
-CORE EXPERTISE
-═══════════════════════════════════════════════════════════════════
+        for lang_resp, readme_resp in await asyncio.gather(*(repo_extras(r) for r in top_repos[:6])):
+            if lang_resp is not None and lang_resp.status_code == 200:
+                for lang, bytes_count in lang_resp.json().items():
+                    language_totals[lang] = language_totals.get(lang, 0) + bytes_count
+            if readme_resp is not None and readme_resp.status_code == 200:
+                readme_hits += 1
 
-SPECIALIZATIONS:
-- Full-stack web development (Next.js, React, Node.js, FastAPI)
-- UI/UX design & Figma design systems
-- AI/ML integration & LLM engineering
-- Product design thinking (0-to-1 builders)
-- Brand identity & graphic design
-- Responsive web design & performance optimization
+        top_languages = sorted(language_totals.items(), key=lambda kv: kv[1], reverse=True)[:8]
 
-TECH STACK:
-- Frontend: Next.js, React, TypeScript, Tailwind CSS, Three.js, Spline
-- Backend: FastAPI, Node.js, Express
-- Databases: MongoDB, PostgreSQL
-- AI/ML: Groq API, Ollama, ChromaDB, Tesseract OCR
-- Design: Figma, Adobe XD, Photoshop, Illustrator, Canva
-- DevOps: Vercel, Git, GitHub REST API
-- Other: Selenium, Postman, DevTools, Unity
-
-ACADEMIC COURSEWORK:
-- Data Structures & Algorithms (DSA)
-- Database Management Systems (DBMS)
-- Object-Oriented Programming (OOP)
-- Data Analytics with R (DAR)
-- Design & Analysis of Algorithms (DAA)
-- Java programming
-
-═══════════════════════════════════════════════════════════════════
-FLAGSHIP PROJECTS
-═══════════════════════════════════════════════════════════════════
-
-1. ARIA (Adaptive Reality Intelligence Assistant) — Local AI OS
-   Role: Architect & Lead Developer
-   Tech: Python, FastAPI, Next.js, Ollama, ChromaDB, Tesseract OCR
-   Status: Production-ready, multi-phase implementation
-   Features:
-   - Fully local AI system with zero cloud dependencies
-   - Persistent vector memory using ChromaDB embeddings
-   - Real-time screen context awareness via Tesseract OCR
-   - Multi-modal input (screen capture, voice, semantic search)
-   - Deployed on 16GB systems without external APIs
-   - Screen content indexing for mid-conversation reference
-   Key Achievement: Removed cloud API latency while maintaining offline-first privacy
-
-2. Groundtruth (formerly InsightFlow) — AI-Powered Profile Audit
-   Role: Full-Stack + Product Designer
-   Tech: FastAPI, Groq (Llama 3.3 70B), Next.js, GitHub REST API, Vercel
-   Live: groundtruthai.vercel.app
-   Features:
-   - Analyzes GitHub activity + resume against target job fit
-   - Surfaces skill gaps, over-exposure, and readiness gaps
-   - Intelligent scoring algorithm (15+ skill dimensions, 94% accuracy)
-   - Real-time GitHub profile ingestion
-   - Enterprise-grade response time (<2s)
-   Key Achievement: Full 0-to-1 product launch with AI-powered insights
-
-3. Personal Portfolio Website — Interactive Editorial Design
-   Role: Designer & Developer
-   Tech: Next.js, Three.js, Spline 3D, Tailwind, TypeScript
-   Live: rickyfender.vercel.app
-   Design Direction: Dark, editorial aesthetic with bold oversized typography
-   Features:
-   - Custom 3D scene (Spline integration) in hero
-   - Staggered fade-up text reveal animations
-   - Syne + DM Sans typography system
-   - Red/black editorial theme
-   - Marquee strips & dynamic stats
-   - Project cards & process timeline
-   - Interactive, "vibecoder" aesthetic
-   Key Achievement: Unified representation of all specializations (code, design, AI)
-
-4. Creatiwise Brand Identity — Professional Branding
-   Role: Brand Strategist & Logo Designer
-   Deliverables:
-   - 4 logo concepts: The Spark, The Grid, The Orbit, gradient C
-   - 8 dark/light variations per concept
-   - Professional brand guide & competitive analysis
-   Color Palette: Navy #1A1F5E, Magenta #E8186D
-   Tools: Figma
-   Key Achievement: Enterprise-grade brand system across visual identity
-
-5. Design Portfolio Clients — 10+ Brand Redesigns
-   Services: Full visual identities, design systems, brand guidelines, mockups
-   Approach: Client-tailored color & typography systems
-   Example: Creatiwise — 4 concepts, 8 variations, full guidelines
-   Key Achievement: End-to-end design lifecycle from concept to deployment
-
-═══════════════════════════════════════════════════════════════════
-RECENT WORK & EXPERIENCE
-═══════════════════════════════════════════════════════════════════
-
-INTERNSHIPS & TRIAL PROJECTS:
-- Digital Heroes: GST Invoice Generator (trial task, Vercel deployment)
-- Digital Heroes: AI Literacy Quiz (internship pipeline screening)
-- Accredian: Data Science screening (Jupyter notebook, regression modeling)
-- Sheetal.net: QA internship (Selenium, Postman, DevTools)
-- Underpin Technology: Game Development internship (Unity slot machine)
-- Google Gemini Student Ambassador Program: Shortlisted (video application prepared)
-
-EDUCATION & INTERVIEWS:
-- Preparing for HighScores AI interviews (ML/DL fundamentals)
-- Java final exam & BEFA exam prep
-- Generated comprehensive viva prep materials
-
-═══════════════════════════════════════════════════════════════════
-DESIGN BACKGROUND & HISTORY
-═══════════════════════════════════════════════════════════════════
-
-- Long-standing graphic design interest predating AI & full-stack focus
-- 2+ years freelance design work on Upwork
-- Church design work (2+ years): social media posts, thumbnails, campaign assets
-- Early portfolio: VOID app (indie social platform on Play Store) — campaign assets, design guidelines
-- Specialization: Logo design, brand identity, social media creatives, UI/UX
-- Design philosophy: Unified visual systems with intentional color & typography
-
-═══════════════════════════════════════════════════════════════════
-PERSONAL INTERESTS & HOBBIES
-═══════════════════════════════════════════════════════════════════
-
-CREATIVE PURSUITS:
-- Photography (interested in developing skills)
-- Social media content creation (building growing presence)
-- YouTube Shorts & AI Shorts exploration (comfort content / AI world-building format)
-- Content creation toolchain: Luma Dream Machine, ElevenLabs, CapCut
-
-TECH INTERESTS:
-- Audio gear optimization (IEM recommendations, EQ optimization)
-- Device setup & customization (Poco F7 with HyperOS)
-- Live wallpapers & Bluetooth audio optimization
-
-LIFESTYLE:
-- Cooking (active hobby)
-- Fitness & structured gym programming
-- AI & LLM enthusiast
-
-═══════════════════════════════════════════════════════════════════
-KEY DIFFERENTIATORS
-═══════════════════════════════════════════════════════════════════
-
-✓ Full-stack expertise spanning design, frontend, backend, and AI/ML
-✓ Proven 0-to-1 product builder (ARIA, Groundtruth, portfolio)
-✓ Enterprise-grade UI/UX with Figma design systems
-✓ AI engineer with practical LLM integration experience
-✓ 10+ successful client design projects
-✓ Balanced skill representation across specializations
-✓ Local AI & privacy-first system architecture
-✓ High-performance, low-latency AI applications
-✓ Strong problem-solver with creative solutions
-✓ Interdisciplinary background (design + engineering + AI)
-
-═══════════════════════════════════════════════════════════════════
-WHAT HE'S LOOKING FOR
-═══════════════════════════════════════════════════════════════════
-
-Open to:
-- Full-stack development roles
-- UI/UX design positions
-- AI/ML engineering roles
-- Paid internships in any of the above
-- Contract/freelance full-stack or design work
-
-Preferences:
-- Prefers roles that let him apply multiple specializations equally
-- Interested in AI-forward companies
-- Open to remote or in-office (Hyderabad-based)
-
-═══════════════════════════════════════════════════════════════════
-GUIDELINES
-═══════════════════════════════════════════════════════════════════
-
-When answering questions:
-- Stay grounded in the facts above; if something isn't covered, say "I don't have that detail"
-- Keep responses concise and conversational
-- Speak about him in third person (unless asked to write as if you were him)
-- Share APPROVED CONTACT / LINKS only — never personal phone or private email
-- Reference specific project details, tech choices, and achievements when relevant
-- Be enthusiastic about his work but honest about limitations"""
+        return {
+            "username": username,
+            "name": user.get("name"),
+            "bio": user.get("bio"),
+            "public_repos": user.get("public_repos", 0),
+            "followers": user.get("followers", 0),
+            "account_created": user.get("created_at"),
+            "top_repos": [
+                {
+                    "name": r["name"],
+                    "description": r.get("description"),
+                    "stars": r.get("stargazers_count", 0),
+                    "forks": r.get("forks_count", 0),
+                    "language": r.get("language"),
+                    "updated_at": r.get("updated_at"),
+                    "has_description": bool(r.get("description")),
+                }
+                for r in top_repos
+            ],
+            "total_non_fork_repos": len(non_fork),
+            "languages": [lang for lang, _ in top_languages],
+            "readme_coverage": f"{readme_hits}/{min(6, len(top_repos))} top repos have a README",
+        }
 
 
 # ---------------------------------------------------------------------------
-# API Models
+# Resume parsing
 # ---------------------------------------------------------------------------
 
-class QueryRequest(BaseModel):
-    question: str
-
-
-class QueryResponse(BaseModel):
-    answer: str
-
-
-# ---------------------------------------------------------------------------
-# HTML UI
-# ---------------------------------------------------------------------------
-
-DEMO_HTML = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Vineeth GPT</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
-<style>
-  :root{
-    --paper:#f7f6f2;
-    --ink:#15151a;
-    --muted:#8a8a8f;
-    --line:#e3e1da;
-    --navy:#1a1f5e;
-    --magenta:#e8186d;
-    --serif:'Fraunces', serif;
-    --sans:'Inter', -apple-system, sans-serif;
-  }
-  html[data-theme="dark"]{
-    --paper:#111114;
-    --ink:#efeef0;
-    --muted:#8d8d95;
-    --line:#2a2a30;
-    --navy:#8990e0;
-    --magenta:#ff5c95;
-  }
-  *{box-sizing:border-box;}
-  html,body{margin:0; padding:0;}
-  body{
-    font-family:var(--sans);
-    color:var(--ink);
-    background:var(--paper);
-    min-height:100vh;
-    position:relative;
-    overflow-x:hidden;
-    transition:background 0.25s ease, color 0.25s ease;
-  }
-
-  .bg{
-    position:fixed;
-    inset:0;
-    z-index:0;
-    pointer-events:none;
-  }
-  .bg::before, .bg::after{
-    content:'';
-    position:absolute;
-    width:60vmax;
-    height:60vmax;
-    border-radius:50%;
-    filter:blur(90px);
-    opacity:0.10;
-  }
-  .bg::before{ background:var(--navy); top:-20vmax; left:-15vmax; }
-  .bg::after{ background:var(--magenta); bottom:-25vmax; right:-18vmax; opacity:0.08; }
-  .grain{
-    position:fixed; inset:0; z-index:0; pointer-events:none;
-    opacity:0.035; mix-blend-mode:multiply;
-    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
-  }
-
-  .wrap{
-    position:relative;
-    z-index:1;
-    max-width:620px;
-    margin:0 auto;
-    padding:72px 24px 60px;
-  }
-
-  header{ margin-bottom:44px; }
-  .eyebrow{
-    font-size:12px;
-    letter-spacing:0.12em;
-    text-transform:uppercase;
-    color:var(--navy);
-    font-weight:600;
-    margin-bottom:14px;
-  }
-  .eyebrow-row{
-    display:flex;
-    align-items:center;
-    justify-content:space-between;
-    gap:12px;
-  }
-  .theme-toggle{
-    width:34px;
-    height:34px;
-    border-radius:50%;
-    border:1px solid var(--line);
-    background:transparent;
-    color:var(--ink);
-    display:flex;
-    align-items:center;
-    justify-content:center;
-    cursor:pointer;
-    flex-shrink:0;
-    transition:border-color 0.2s ease, color 0.2s ease;
-  }
-  .theme-toggle:hover{ border-color:var(--magenta); color:var(--magenta); }
-  .theme-toggle svg{ width:16px; height:16px; }
-  .theme-toggle .icon-moon{ display:none; }
-  html[data-theme="dark"] .theme-toggle .icon-sun{ display:none; }
-  html[data-theme="dark"] .theme-toggle .icon-moon{ display:block; }
-
-  h1{
-    font-family:var(--serif);
-    font-weight:500;
-    font-size:clamp(32px, 6vw, 46px);
-    line-height:1.08;
-    letter-spacing:-0.01em;
-    margin:0 0 12px;
-  }
-  h1 em{
-    font-style:italic;
-    color:var(--magenta);
-  }
-  p.sub{
-    color:var(--muted);
-    font-size:15.5px;
-    line-height:1.6;
-    max-width:440px;
-    margin:0;
-  }
-
-  .composer{
-    margin-top:38px;
-    border-bottom:1.5px solid var(--ink);
-    padding-bottom:10px;
-    display:flex;
-    align-items:flex-end;
-    gap:14px;
-    transition:border-color 0.2s ease;
-  }
-  .composer:focus-within{ border-color:var(--magenta); }
-  textarea{
-    flex:1;
-    border:none;
-    background:transparent;
-    resize:none;
-    font-family:var(--sans);
-    font-size:17px;
-    color:var(--ink);
-    padding:6px 0;
-    min-height:28px;
-    max-height:120px;
-  }
-  textarea::placeholder{ color:var(--muted); }
-  textarea:focus{ outline:none; }
-  button.send{
-    font-family:var(--sans);
-    font-weight:600;
-    font-size:13px;
-    letter-spacing:0.02em;
-    background:none;
-    border:none;
-    color:var(--ink);
-    cursor:pointer;
-    padding:6px 2px;
-    white-space:nowrap;
-    display:flex;
-    align-items:center;
-    gap:6px;
-  }
-  button.send:hover{ color:var(--magenta); }
-  button.send:disabled{ color:var(--muted); cursor:default; }
-  button.send svg{ width:14px; height:14px; }
-
-  .suggestions{
-    display:flex;
-    flex-wrap:wrap;
-    gap:8px 18px;
-    margin-top:16px;
-  }
-  .sug{
-    font-size:13px;
-    color:var(--muted);
-    cursor:pointer;
-    border-bottom:1px solid transparent;
-    transition:all 0.15s ease;
-  }
-  .sug:hover{ color:var(--navy); border-color:var(--navy); }
-
-  .transcript{ margin-top:52px; }
-  .entry{
-    padding:28px 0;
-    border-top:1px solid var(--line);
-    animation:rise 0.4s ease both;
-  }
-  .entry:first-child{ border-top:1px solid var(--line); }
-  @keyframes rise{
-    from{ opacity:0; transform:translateY(6px); }
-    to{ opacity:1; transform:translateY(0); }
-  }
-  .q-label{
-    font-size:11px;
-    font-weight:600;
-    letter-spacing:0.1em;
-    color:var(--magenta);
-    margin-bottom:8px;
-  }
-  .q-text{
-    font-family:var(--serif);
-    font-size:19px;
-    font-weight:500;
-    line-height:1.35;
-    margin-bottom:18px;
-  }
-  .a-label{
-    font-size:11px;
-    font-weight:600;
-    letter-spacing:0.1em;
-    color:var(--muted);
-    margin-bottom:8px;
-  }
-  .a-text{
-    font-size:16px;
-    line-height:1.7;
-    color:var(--ink);
-    white-space:pre-wrap;
-  }
-  .a-text.error{ color:#b3261e; }
-  .a-text.loading{ color:var(--muted); }
-
-  .empty{
-    color:var(--muted);
-    font-size:14px;
-    padding:36px 0;
-    border-top:1px solid var(--line);
-  }
-
-  footer{
-    margin-top:56px;
-    padding-top:20px;
-    border-top:1px solid var(--line);
-    display:flex;
-    flex-wrap:wrap;
-    gap:18px;
-    font-size:13px;
-  }
-  footer a{
-    color:var(--muted);
-    text-decoration:none;
-    border-bottom:1px solid transparent;
-  }
-  footer a:hover{ color:var(--navy); border-color:var(--navy); }
-
-  @media (max-width:480px){
-    .wrap{ padding:52px 18px 40px; }
-    .q-text{ font-size:17px; }
-  }
-</style>
-</head>
-<body>
-  <div class="bg"></div>
-  <div class="grain"></div>
-
-  <div class="wrap">
-    <header>
-      <div class="eyebrow-row">
-        <div class="eyebrow">Vineeth GPT</div>
-        <button class="theme-toggle" id="themeToggle" aria-label="Toggle dark mode">
-          <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
-          <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/></svg>
-        </button>
-      </div>
-      <h1>Everything about<br><em>Vineeth</em>, answered.</h1>
-      <p class="sub">Full-stack developer, UI/UX designer, and AI engineer. Ask about his projects, stack, or what he's looking for next.</p>
-
-      <div class="composer">
-        <textarea id="question" placeholder="What's his tech stack?" rows="1"></textarea>
-        <button class="send" id="sendBtn">
-          Ask
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
-        </button>
-      </div>
-
-      <div class="suggestions">
-        <span class="sug" data-q="What's his tech stack?">tech stack</span>
-        <span class="sug" data-q="Tell me about ARIA.">ARIA</span>
-        <span class="sug" data-q="What design work has he done?">design work</span>
-        <span class="sug" data-q="What roles is he open to?">open roles</span>
-      </div>
-    </header>
-
-    <div class="transcript" id="transcript">
-      <div class="empty" id="emptyState">Nothing asked yet — start above, or pick a prompt.</div>
-    </div>
-
-    <footer>
-      <a href="https://rickyfender.netlify.app" target="_blank">Portfolio</a>
-      <a href="https://github.com/FenderRicky" target="_blank">GitHub</a>
-      <a href="https://www.linkedin.com/in/vineeth-thadigotla-0569381b9/" target="_blank">LinkedIn</a>
-      <a href="https://www.instagram.com/fender_ricky" target="_blank">Instagram</a>
-    </footer>
-  </div>
-
-<script>
-  const root = document.documentElement;
-  const themeToggle = document.getElementById('themeToggle');
-
-  function applyTheme(theme){
-    root.setAttribute('data-theme', theme);
-    localStorage.setItem('vineethgpt-theme', theme);
-  }
-
-  const savedTheme = localStorage.getItem('vineethgpt-theme');
-  const systemPrefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-  applyTheme(savedTheme || (systemPrefersDark ? 'dark' : 'light'));
-
-  themeToggle.addEventListener('click', () => {
-    const current = root.getAttribute('data-theme');
-    applyTheme(current === 'dark' ? 'light' : 'dark');
-  });
-
-  const input = document.getElementById('question');
-  const sendBtn = document.getElementById('sendBtn');
-  const transcript = document.getElementById('transcript');
-  const emptyState = document.getElementById('emptyState');
-
-  function autoresize(){
-    input.style.height = 'auto';
-    input.style.height = Math.min(input.scrollHeight, 120) + 'px';
-  }
-
-  function addEntry(question){
-    emptyState.style.display = 'none';
-    const entry = document.createElement('div');
-    entry.className = 'entry';
-    entry.innerHTML = `
-      <div class="q-label">QUESTION</div>
-      <div class="q-text"></div>
-      <div class="a-label">ANSWER</div>
-      <div class="a-text loading">Thinking…</div>
-    `;
-    entry.querySelector('.q-text').textContent = question;
-    transcript.prepend(entry);
-    return entry.querySelector('.a-text');
-  }
-
-  async function ask(question){
-    const q = (question || input.value).trim();
-    if (!q) return;
-
-    input.value = '';
-    autoresize();
-    sendBtn.disabled = true;
-
-    const answerEl = addEntry(q);
-
-    try {
-      const res = await fetch('/api/ask', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question: q })
-      });
-
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || 'Request failed');
-      
-      answerEl.textContent = data.answer;
-      answerEl.classList.remove('loading');
-    } catch (err) {
-      answerEl.textContent = 'Something went wrong: ' + err.message;
-      answerEl.classList.remove('loading');
-      answerEl.classList.add('error');
-    } finally {
-      sendBtn.disabled = false;
-    }
-  }
-
-  sendBtn.addEventListener('click', () => ask());
-  input.addEventListener('input', autoresize);
-  input.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      ask();
-    }
-  });
-  document.querySelectorAll('.sug').forEach(el => {
-    el.addEventListener('click', () => ask(el.dataset.q));
-  });
-</script>
-</body>
-</html>
-"""
+def extract_resume_text(file_bytes: bytes) -> str:
+    try:
+        reader = PdfReader(io.BytesIO(file_bytes))
+        text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        text = text.strip()
+        if not text:
+            raise ValueError("empty")
+        return text[:6000]
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not read the resume PDF. Make sure it's a valid, text-based PDF (not a scanned image).")
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# Analysis — one combined LLM call over real data
 # ---------------------------------------------------------------------------
+
+def build_prompt(github_data: dict, resume_text: str, target_job: Optional[str]) -> str:
+    job_section = (
+        f"\nTARGET JOB:\n{target_job}\n\nWeigh the entire analysis specifically against this target job's requirements."
+        if target_job
+        else "\nNo specific target job was given — evaluate general software engineering / tech role readiness."
+    )
+
+    return f"""You are a blunt, expert technical recruiter and hiring manager. Analyze this person's real GitHub profile and resume together. Be specific and honest — this is for someone who wants to actually improve, not feel good.
+
+GITHUB PROFILE (real data, fetched live):
+Username: {github_data['username']}
+Name: {github_data.get('name')}
+Bio: {github_data.get('bio')}
+Public repos: {github_data['public_repos']} (non-fork: {github_data['total_non_fork_repos']})
+Followers: {github_data['followers']}
+Top languages used: {', '.join(github_data['languages']) or 'none detected'}
+README coverage: {github_data['readme_coverage']}
+Top repositories:
+{json.dumps(github_data['top_repos'], indent=2)}
+
+RESUME TEXT:
+{resume_text}
+{job_section}
+
+Respond ONLY with valid JSON (no markdown fences, no preamble), exactly this structure:
+{{
+  "overall_readiness_score": <0-100 integer>,
+  "target_job_verdict": "<one sentence verdict if a target job was given, else null>",
+  "skill_gaps": ["<specific missing skill/experience vs what's claimed or targeted>", ...3-5 items],
+  "over_exposure": ["<specific thing that's overrepresented, scattered, or undermines focus — e.g. too many abandoned repos, skills listed but never demonstrated in any project>", ...2-4 items],
+  "strengths": ["<specific genuine strength backed by real evidence from the data above>", ...3-5 items],
+  "next_steps": ["<concrete, specific action — not generic advice>", ...4-6 items],
+  "github_notes": "<2-3 sentences on what the GitHub activity actually shows>",
+  "resume_notes": "<2-3 sentences on how well the resume matches what GitHub actually demonstrates>"
+}}"""
+
+
+def _parse_json(raw: str) -> dict:
+    raw = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                pass
+    raise HTTPException(status_code=502, detail="AI response could not be parsed. Please try again.")
+
+
+def call_llm(prompt: str) -> dict:
+    client = get_client()
+    messages = [
+        {"role": "system", "content": "You always respond with strictly valid JSON matching the requested schema. No markdown, no code fences, no commentary outside the JSON object."},
+        {"role": "user", "content": prompt},
+    ]
+    last_err = None
+    for model in dict.fromkeys([GENERATION_MODEL, FALLBACK_MODEL]):  # primary, then fallback
+        try:
+            completion = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.4,
+                response_format={"type": "json_object"},
+            )
+            return _parse_json(completion.choices[0].message.content or "")
+        except HTTPException:
+            raise
+        except Exception as e:  # Groq SDK errors: decommissioned model, rate limit, bad request...
+            log.exception("Groq call failed for model %s", model)
+            last_err = e
+    raise HTTPException(status_code=502, detail=f"AI provider error: {str(last_err)[:300]}")
+
+
+def _str_list(v) -> list:
+    if not isinstance(v, list):
+        return []
+    return [x if isinstance(x, str) else json.dumps(x) for x in v]
+
+
+# ---------------------------------------------------------------------------
+# API
+# ---------------------------------------------------------------------------
+
+class AnalyzeResponse(BaseModel):
+    overall_readiness_score: int
+    target_job_verdict: Optional[str] = None
+    skill_gaps: list[str]
+    over_exposure: list[str]
+    strengths: list[str]
+    next_steps: list[str]
+    github_notes: str
+    resume_notes: str
+    github_summary: dict
+
 
 @app.get("/", response_class=HTMLResponse)
-def demo_page():
-    return DEMO_HTML
+def home():
+    return HTML_PAGE
 
 
 @app.get("/api")
 @app.get("/api/")
 def root():
-    return {"status": "ok", "message": "Ask Vineeth API is running"}
+    return {"status": "ok", "message": "Groundtruth API is running"}
 
 
-@app.post("/api/ask", response_model=QueryResponse)
-def ask(req: QueryRequest):
-    if not req.question or not req.question.strip():
-        raise HTTPException(status_code=400, detail="`question` must not be empty.")
+@app.post("/api/analyze", response_model=AnalyzeResponse)
+async def analyze(
+    github: str = Form(...),
+    target_job: Optional[str] = Form(None),
+    resume: UploadFile = File(...),
+):
+    if not github.strip():
+        raise HTTPException(status_code=400, detail="GitHub username or URL is required.")
 
-    check_rate_limit()
+    username = extract_github_username(github)
+    github_data = await fetch_github_profile(username)
+
+    resume_bytes = await resume.read()
+    if not resume_bytes:
+        raise HTTPException(status_code=400, detail="Resume file is empty.")
+    resume_text = extract_resume_text(resume_bytes)
+
+    prompt = build_prompt(github_data, resume_text, target_job.strip() if target_job else None)
+    result = call_llm(prompt)
 
     try:
-        client = get_client()
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": req.question},
-        ]
-        completion = None
-        last_err = None
-        for model in dict.fromkeys([GENERATION_MODEL, FALLBACK_MODEL]):  # primary, then fallback
-            try:
-                completion = client.chat.completions.create(model=model, messages=messages, temperature=0.6)
-                break
-            except Exception as e:
-                msg = str(e).lower()
-                if "429" in msg or "rate_limit" in msg or "401" in msg or "authentication" in msg:
-                    raise  # fallback model won't help; handled below
-                last_err = e
-        if completion is None:
-            raise last_err
-
-        # Safely extract the answer
-        if not completion.choices or not completion.choices[0].message:
-            raise HTTPException(
-                status_code=500,
-                detail="Groq returned an empty response. Try again."
-            )
-
-        answer = completion.choices[0].message.content
-        if not answer:
-            raise HTTPException(
-                status_code=500,
-                detail="Groq returned empty content. Try again."
-            )
-
-        return QueryResponse(answer=answer)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        # Catch Groq errors, network errors, etc.
-        error_msg = str(e)
-        if "429" in error_msg or "rate_limit" in error_msg.lower():
-            raise HTTPException(
-                status_code=429,
-                detail="Groq rate limit exceeded. Try again in a few minutes."
-            )
-        elif "401" in error_msg or "authentication" in error_msg.lower():
-            raise HTTPException(
-                status_code=500,
-                detail="Groq API authentication failed. Check your API key."
-            )
-        else:
-            raise HTTPException(
-                status_code=500,
-                detail=f"API error: {error_msg[:100]}"
-            )
+        score = int(float(result.get("overall_readiness_score", 50)))
+    except (TypeError, ValueError):
+        score = 50
+    verdict = result.get("target_job_verdict")
+    return {
+        "overall_readiness_score": max(0, min(100, score)),
+        "target_job_verdict": verdict if isinstance(verdict, str) else None,
+        "skill_gaps": _str_list(result.get("skill_gaps")),
+        "over_exposure": _str_list(result.get("over_exposure")),
+        "strengths": _str_list(result.get("strengths")),
+        "next_steps": _str_list(result.get("next_steps")),
+        "github_notes": str(result.get("github_notes") or ""),
+        "resume_notes": str(result.get("resume_notes") or ""),
+        "github_summary": github_data,
+    }
 
 
 # ---------------------------------------------------------------------------
-# IMPORTANT — the real usage cap
+# Frontend — single page, matches the red/black editorial system
 # ---------------------------------------------------------------------------
-# The in-memory rate limiter above only protects a single warm serverless
-# instance. Vercel can spin up multiple instances under load, each with its
-# own counter, so it's a soft speed bump, not a hard guarantee.
-#
-# Groq's free tier is enforced server-side per API key/account (roughly
-# 30 requests/min and ~1,000 requests/day for llama-3.3-70b-versatile as of
-# 2026 — check console.groq.com for your account's current limits). That's
-# the real backstop: once you hit it, Groq itself returns a 429, regardless
-# of how many serverless instances Vercel spins up.
+
+HTML_PAGE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Groundtruth — Profile Readiness Audit</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0A0A0A;
+    --red:#C81E1E;
+    --red-deep:#7A1414;
+    --text:#F5F5F5;
+    --muted:#8A8A8A;
+    --panel:#131313;
+    --line:#262626;
+    --display:'Archivo Black', sans-serif;
+    --sans:'DM Sans', sans-serif;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0; padding:0;}
+  body{
+    background:var(--bg);
+    color:var(--text);
+    font-family:var(--sans);
+    min-height:100vh;
+  }
+  .wrap{max-width:820px; margin:0 auto; padding:70px 24px 100px;}
+
+  .brand-mark{
+    font-family:var(--display); font-size:14px; letter-spacing:0.02em;
+    color:var(--text); margin-bottom:44px; display:flex; align-items:center; gap:8px;
+  }
+  .brand-mark .dot{width:7px; height:7px; background:var(--red); border-radius:50%;}
+
+  .eyebrow{
+    font-size:12px; letter-spacing:0.14em; text-transform:uppercase;
+    color:var(--red); font-weight:700; margin-bottom:18px;
+  }
+  h1{
+    font-family:var(--display); font-weight:400;
+    font-size:clamp(32px, 6vw, 52px); line-height:1.05;
+    letter-spacing:-0.01em; margin:0 0 16px; text-transform:uppercase;
+  }
+  h1 span{color:var(--red);}
+  p.sub{color:var(--muted); font-size:16px; line-height:1.6; max-width:560px; margin:0 0 44px;}
+
+  form{border:1px solid var(--line); background:var(--panel); padding:32px;}
+  .field{margin-bottom:22px;}
+  label{
+    display:block; font-size:11px; letter-spacing:0.1em; text-transform:uppercase;
+    color:var(--muted); font-weight:700; margin-bottom:10px;
+  }
+  input[type="text"], textarea{
+    width:100%; background:var(--bg); border:1px solid var(--line); color:var(--text);
+    font-family:var(--sans); font-size:15px; padding:13px 14px;
+  }
+  textarea{resize:vertical; min-height:80px;}
+  input[type="text"]:focus, textarea:focus{outline:none; border-color:var(--red);}
+
+  .file-drop{
+    border:1px dashed var(--line); background:var(--bg); padding:20px; text-align:center;
+    cursor:pointer; transition:border-color .15s ease;
+  }
+  .file-drop:hover, .file-drop.active{border-color:var(--red);}
+  .file-drop input{display:none;}
+  .file-drop .fname{color:var(--red); font-weight:600; margin-top:6px; font-size:13px;}
+
+  button.submit{
+    width:100%; background:var(--red); color:#fff; border:none;
+    font-family:var(--display); font-size:15px; letter-spacing:0.04em;
+    padding:16px; cursor:pointer; text-transform:uppercase; margin-top:8px;
+    transition:opacity .15s ease;
+  }
+  button.submit:hover{opacity:.88;}
+  button.submit:disabled{background:var(--line); color:var(--muted); cursor:not-allowed;}
+
+  .error-box{
+    display:none; margin-top:18px; padding:14px 16px; border:1px solid var(--red);
+    background:rgba(200,30,30,0.08); color:#ff9a9a; font-size:14px;
+  }
+  .error-box.show{display:block;}
+
+  #results{display:none; margin-top:50px;}
+  #results.show{display:block;}
+
+  .score-block{
+    display:flex; align-items:center; gap:32px; border-bottom:1px solid var(--line);
+    padding-bottom:32px; margin-bottom:32px;
+  }
+  .gauge-wrap{position:relative; width:140px; height:140px; flex-shrink:0;}
+  .gauge-wrap svg{transform:rotate(-90deg);}
+  .gauge-track{fill:none; stroke:var(--line); stroke-width:8;}
+  .gauge-fill{
+    fill:none; stroke:var(--red); stroke-width:8; stroke-linecap:round;
+    stroke-dasharray:352; stroke-dashoffset:352;
+    transition:stroke-dashoffset 1.1s cubic-bezier(0.16,1,0.3,1);
+  }
+  .gauge-num{
+    position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+    font-family:var(--display); font-size:36px; color:var(--text);
+  }
+  .score-label{color:var(--muted); font-size:14px; max-width:320px; line-height:1.5;}
+  .verdict{
+    margin-top:12px; padding:14px 16px; background:var(--panel); border-left:3px solid var(--red);
+    font-size:14.5px; line-height:1.5;
+  }
+
+  .section{margin-bottom:36px; opacity:0; transform:translateY(14px); transition:opacity .5s ease, transform .5s ease;}
+  .section.reveal{opacity:1; transform:translateY(0);}
+  .section-label{
+    font-family:var(--display); font-size:13px; letter-spacing:0.06em; color:var(--red);
+    text-transform:uppercase; margin-bottom:14px;
+  }
+  ul.item-list{list-style:none; margin:0; padding:0;}
+  ul.item-list li{
+    padding:12px 0 12px 20px; border-top:1px solid var(--line); font-size:14.5px; line-height:1.5;
+    position:relative; transition:padding-left .15s ease, border-color .15s ease;
+  }
+  ul.item-list li::before{
+    content:'—'; position:absolute; left:0; color:var(--red); transition:left .15s ease;
+  }
+  ul.item-list li:hover{padding-left:26px; border-color:var(--red);}
+  ul.item-list li:hover::before{left:6px;}
+
+  .actions-row{display:flex; gap:10px; margin-top:8px; margin-bottom:40px;}
+  .copy-btn{
+    font-family:var(--sans); font-size:13px; font-weight:600; color:var(--text);
+    background:transparent; border:1px solid var(--line); padding:10px 16px; cursor:pointer;
+    transition:border-color .15s ease, color .15s ease;
+  }
+  .copy-btn:hover{border-color:var(--red); color:var(--red);}
+  .copy-btn.copied{border-color:var(--red); color:var(--red);}
+
+  .notes-grid{display:grid; grid-template-columns:1fr 1fr; gap:18px;}
+  .notes-card{border:1px solid var(--line); padding:18px; background:var(--panel);}
+  .notes-card h4{
+    font-size:11px; letter-spacing:0.08em; text-transform:uppercase; color:var(--muted);
+    margin:0 0 10px; font-weight:700;
+  }
+  .notes-card p{font-size:14px; line-height:1.6; margin:0; color:var(--text);}
+
+  .loading{display:none; text-align:center; padding:60px 0; color:var(--muted); font-size:14px;}
+  .loading.show{display:block;}
+  .loading .dot{
+    display:inline-block; width:8px; height:8px; background:var(--red);
+    border-radius:50%; margin:0 3px; animation:pulse 1.2s infinite ease-in-out;
+  }
+  .loading .dot:nth-child(2){animation-delay:0.15s;}
+  .loading .dot:nth-child(3){animation-delay:0.3s;}
+  @keyframes pulse{0%,80%,100%{opacity:0.25;} 40%{opacity:1;}}
+
+  @media (max-width:600px){
+    .notes-grid{grid-template-columns:1fr;}
+    .score-block{flex-direction:column; gap:8px;}
+    .score-num{font-size:72px;}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand-mark"><span class="dot"></span>GROUNDTRUTH</div>
+  <div class="eyebrow">Profile Readiness Audit</div>
+  <h1>Where you <span>actually</span> stand.</h1>
+  <p class="sub">Real GitHub data. Your real resume. One honest report on what's missing, what's overexposed, and whether you're ready for the role you want.</p>
+
+  <form id="analyzeForm">
+    <div class="field">
+      <label for="github">GitHub Username or URL</label>
+      <input type="text" id="github" name="github" placeholder="e.g. FenderRicky or github.com/FenderRicky" required />
+    </div>
+
+    <div class="field">
+      <label for="resumeInput">Resume (PDF)</label>
+      <div class="file-drop" id="fileDrop">
+        <input type="file" id="resumeInput" name="resume" accept="application/pdf" required />
+        <div id="fileDropText">Click to upload your resume PDF</div>
+        <div class="fname" id="fileName"></div>
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="targetJob">Target Job (optional)</label>
+      <textarea id="targetJob" name="target_job" placeholder="Paste a job title or full job description to compare against — e.g. 'Frontend Engineer, mid-level, React + TypeScript'"></textarea>
+    </div>
+
+    <button type="submit" class="submit" id="submitBtn">Run Audit</button>
+    <div class="error-box" id="errorBox"></div>
+  </form>
+
+  <div class="loading" id="loadingBox">
+    Analyzing your real GitHub activity and resume <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+  </div>
+
+  <div id="results">
+    <div class="score-block">
+      <div class="gauge-wrap">
+        <svg width="140" height="140" viewBox="0 0 130 130">
+          <circle class="gauge-track" cx="65" cy="65" r="56"></circle>
+          <circle class="gauge-fill" id="gaugeFill" cx="65" cy="65" r="56"></circle>
+        </svg>
+        <div class="gauge-num" id="scoreNum">--</div>
+      </div>
+      <div class="score-label">Overall readiness score, based on real GitHub activity and your resume — not a generic template match.</div>
+    </div>
+    <div class="verdict" id="verdictBox" style="display:none;"></div>
+
+    <div class="section" id="secGaps">
+      <div class="section-label">Skill Gaps</div>
+      <ul class="item-list" id="skillGaps"></ul>
+    </div>
+
+    <div class="section" id="secExposure">
+      <div class="section-label">Over-Exposure</div>
+      <ul class="item-list" id="overExposure"></ul>
+    </div>
+
+    <div class="section" id="secStrengths">
+      <div class="section-label">Strengths</div>
+      <ul class="item-list" id="strengths"></ul>
+    </div>
+
+    <div class="section" id="secSteps">
+      <div class="section-label">Next Steps</div>
+      <ul class="item-list" id="nextSteps"></ul>
+    </div>
+
+    <div class="section" id="secNotes">
+      <div class="notes-grid">
+        <div class="notes-card">
+          <h4>GitHub Notes</h4>
+          <p id="githubNotes"></p>
+        </div>
+        <div class="notes-card">
+          <h4>Resume vs. GitHub</h4>
+          <p id="resumeNotes"></p>
+        </div>
+      </div>
+      <div class="actions-row">
+        <button class="copy-btn" id="copyBtn">Copy Report</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const form = document.getElementById('analyzeForm');
+  const fileInput = document.getElementById('resumeInput');
+  const fileDrop = document.getElementById('fileDrop');
+  const fileDropText = document.getElementById('fileDropText');
+  const fileName = document.getElementById('fileName');
+  const submitBtn = document.getElementById('submitBtn');
+  const errorBox = document.getElementById('errorBox');
+  const loadingBox = document.getElementById('loadingBox');
+  const results = document.getElementById('results');
+
+  fileDrop.addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', () => {
+    if (fileInput.files.length) {
+      fileName.textContent = fileInput.files[0].name;
+      fileDropText.textContent = 'Selected:';
+    }
+  });
+
+  function fillList(id, items) {
+    const el = document.getElementById(id);
+    el.innerHTML = '';
+    (items || []).forEach(item => {
+      const li = document.createElement('li');
+      li.textContent = item;
+      el.appendChild(li);
+    });
+  }
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    errorBox.classList.remove('show');
+    results.classList.remove('show');
+    loadingBox.classList.add('show');
+    submitBtn.disabled = true;
+
+    const formData = new FormData(form);
+
+    try {
+      const res = await fetch('/api/analyze', { method: 'POST', body: formData });
+      const text = await res.text();
+      let data;
+      try { data = JSON.parse(text); } catch { data = null; }
+
+      if (!res.ok || !data) {
+        throw new Error((data && data.detail) || `Server error (${res.status}). ${text.slice(0, 120)}`);
+      }
+
+      document.getElementById('scoreNum').textContent = data.overall_readiness_score;
+
+      // animate the circular gauge — circumference is 2*pi*56 ≈ 352
+      const circumference = 352;
+      const offset = circumference - (data.overall_readiness_score / 100) * circumference;
+      const gaugeFill = document.getElementById('gaugeFill');
+      gaugeFill.style.strokeDashoffset = circumference;
+      requestAnimationFrame(() => {
+        setTimeout(() => { gaugeFill.style.strokeDashoffset = offset; }, 50);
+      });
+
+      const verdictBox = document.getElementById('verdictBox');
+      if (data.target_job_verdict) {
+        verdictBox.textContent = data.target_job_verdict;
+        verdictBox.style.display = 'block';
+      } else {
+        verdictBox.style.display = 'none';
+      }
+
+      fillList('skillGaps', data.skill_gaps);
+      fillList('overExposure', data.over_exposure);
+      fillList('strengths', data.strengths);
+      fillList('nextSteps', data.next_steps);
+      document.getElementById('githubNotes').textContent = data.github_notes;
+      document.getElementById('resumeNotes').textContent = data.resume_notes;
+
+      results.classList.add('show');
+      results.scrollIntoView({ behavior: 'smooth', block: 'start' });
+
+      // staggered section reveal
+      const sections = ['secGaps', 'secExposure', 'secStrengths', 'secSteps', 'secNotes'];
+      sections.forEach((id, i) => {
+        const el = document.getElementById(id);
+        el.classList.remove('reveal');
+        setTimeout(() => el.classList.add('reveal'), 150 + i * 120);
+      });
+
+      window._lastReport = data;
+    } catch (err) {
+      errorBox.textContent = err.message;
+      errorBox.classList.add('show');
+    } finally {
+      loadingBox.classList.remove('show');
+      submitBtn.disabled = false;
+    }
+  });
+  document.getElementById('copyBtn').addEventListener('click', () => {
+    const d = window._lastReport;
+    if (!d) return;
+    const lines = [
+      `GROUNDTRUTH REPORT`,
+      `Overall Readiness: ${d.overall_readiness_score}/100`,
+      d.target_job_verdict ? `Target Job Verdict: ${d.target_job_verdict}` : null,
+      ``,
+      `SKILL GAPS`,
+      ...d.skill_gaps.map(x => `- ${x}`),
+      ``,
+      `OVER-EXPOSURE`,
+      ...d.over_exposure.map(x => `- ${x}`),
+      ``,
+      `STRENGTHS`,
+      ...d.strengths.map(x => `- ${x}`),
+      ``,
+      `NEXT STEPS`,
+      ...d.next_steps.map(x => `- ${x}`),
+      ``,
+      `GITHUB NOTES: ${d.github_notes}`,
+      `RESUME VS GITHUB: ${d.resume_notes}`,
+    ].filter(l => l !== null).join('\\n');
+
+    navigator.clipboard.writeText(lines).then(() => {
+      const btn = document.getElementById('copyBtn');
+      btn.textContent = 'Copied ✓';
+      btn.classList.add('copied');
+      setTimeout(() => { btn.textContent = 'Copy Report'; btn.classList.remove('copied'); }, 1800);
+    });
+  });
+</script>
+</body>
+</html>
+"""
