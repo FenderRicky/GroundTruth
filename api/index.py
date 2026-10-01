@@ -35,8 +35,8 @@ from groq import Groq
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")  # optional, but strongly recommended — see README
-GENERATION_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
-FALLBACK_MODEL = os.environ.get("GROQ_FALLBACK_MODEL", "llama-3.1-8b-instant")
+GENERATION_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+FALLBACK_MODEL = os.environ.get("GROQ_FALLBACK_MODEL", "openai/gpt-oss-20b")
 GITHUB_API = "https://api.github.com"
 
 app = FastAPI(title="Groundtruth")
